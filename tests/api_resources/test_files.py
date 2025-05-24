@@ -263,12 +263,84 @@ class TestAsyncFiles:
     parametrize = pytest.mark.parametrize("async_client", [False, True], indirect=True, ids=["loose", "strict"])
 
     @parametrize
-    async def test_method_create(self, async_client: AsyncOpenAI) -> None:
-        file = await async_client.files.create(
-            file=b"raw file contents",
-            purpose="assistants",
-        )
-        assert_matches_type(FileObject, file, path=["response"])
+    @pytest.mark.asyncio # Ensure test is run with asyncio
+    async def test_method_create(self, async_client_fixture: AsyncOpenAI) -> None: # Renamed fixture for clarity
+        # Use the fixture if it's already aiohttp-based, or instantiate directly
+        # For this test, let's assume async_client_fixture is correctly providing an aiohttp-backed client
+        # If not, we would do:
+        # client = AsyncOpenAI(base_url=base_url, api_key="My API Key", _strict_response_validation=True)
+        # For now, using the passed fixture and patching its _client
+        client = async_client_fixture
+
+        mock_session = mock.AsyncMock(spec=aiohttp.ClientSession)
+        mock_aio_response = mock.AsyncMock(spec=aiohttp.ClientResponse)
+        mock_aio_response.status = 200
+        mock_aio_response.headers = {"Content-Type": "application/json"}
+        
+        expected_file_response_data = {
+            "id": "file-testfileid",
+            "object": "file",
+            "bytes": 100,
+            "created_at": 1603102001,
+            "filename": "test_file.txt",
+            "purpose": "assistants",
+            "status": "processed",
+            "status_details": None,
+        }
+        mock_aio_response.read = mock.AsyncMock(return_value=json.dumps(expected_file_response_data).encode("utf-8"))
+        mock_aio_response.json = mock.AsyncMock(return_value=expected_file_response_data)
+        mock_aio_response.closed = False
+        mock_aio_response.release = mock.AsyncMock()
+
+        async_cm = mock.AsyncMock()
+        async_cm.__aenter__.return_value = mock_aio_response
+        async_cm.__aexit__.return_value = None
+        mock_session.request.return_value = async_cm
+        
+        original_client_session = client._client # Save to restore if client is a shared fixture
+        client._client = mock_session
+        
+        try:
+            file_obj = await client.files.create(
+                file=b"raw file contents", # This will be a bytesIO internally
+                purpose="assistants",
+            )
+            assert_matches_type(FileObject, file_obj, path=["response"])
+            assert file_obj.id == "file-testfileid"
+            assert file_obj.purpose == "assistants"
+
+            mock_session.request.assert_called_once()
+            args, kwargs = mock_session.request.call_args
+            assert args[0] == "POST" # method
+            assert str(args[1]) == f"{client.base_url}files" # url
+            
+            assert "data" in kwargs
+            assert isinstance(kwargs["data"], aiohttp.FormData)
+            
+            # Inspecting FormData is a bit tricky. We can check its internal _fields
+            # This is for testing purposes; _fields is an internal API.
+            form_data_fields = kwargs["data"]._fields # type: ignore
+            
+            file_field_found = any(
+                f.name == "file" and 
+                f.filename is not None and # Default filename like 'upload' or derived
+                f.content_type == "application/octet-stream" # Default for bytes
+                for f in form_data_fields if isinstance(f, aiohttp.formdata.FormField) # type: ignore
+            )
+            purpose_field_found = any(
+                f.name == "purpose" and 
+                # aiohttp FormData typically converts simple string fields to bytes
+                (f.value == b"assistants" if isinstance(f.value, bytes) else f.value == "assistants")
+                for f in form_data_fields if isinstance(f, aiohttp.formdata.FormField) # type: ignore
+            )
+            assert file_field_found, "File part not found or not correctly configured in FormData"
+            assert purpose_field_found, "Purpose part not found or not correctly configured in FormData"
+
+        finally:
+            client._client = original_client_session # Restore original client session
+            if isinstance(client._client, aiohttp.ClientSession) and not client._client.closed:
+                 await client.close() # Close if we instantiated it directly; fixture handles its own.
+
 
     @parametrize
     async def test_raw_response_create(self, async_client: AsyncOpenAI) -> None:

@@ -243,6 +243,32 @@ def make_event_iterator(
     if sync:
         return Stream(cast_to=object, client=client, response=httpx.Response(200, content=content))._iter_events()
 
+    # Async case: Use a mocked aiohttp.ClientResponse
+    mock_aio_response = mock.AsyncMock(spec=aiohttp.ClientResponse)
+    mock_aio_response.status = 200
+    mock_aio_response.headers = {"Content-Type": "text/event-stream"} # Typical SSE content type
+    
+    mock_stream_reader = mock.MagicMock(spec=aiohttp.StreamReader)
+    # The 'content' argument to make_event_iterator is an Iterator[bytes]
+    # We need to convert it to an AsyncIterator[bytes] for iter_any
+    async def async_content_gen(sync_iter: Iterator[bytes]) -> AsyncIterator[bytes]:
+        for chunk in sync_iter:
+            yield chunk
+
+    mock_stream_reader.iter_any.return_value = async_content_gen(content)
+    mock_aio_response.content = mock_stream_reader
+    mock_aio_response.closed = False
+    mock_aio_response.release = mock.AsyncMock()
+    
+    # Mock request_info for APIError compatibility within AsyncStream
+    mock_request_info = mock.Mock(spec=aiohttp.helpers.RequestInfo) # type: ignore
+    # These can be generic for the purpose of this test as APIError primarily needs method and URL.
+    mock_request_info.url = httpx.URL("http://127.0.0.1:4010/test-stream") # type: ignore
+    mock_request_info.method = "POST" 
+    mock_request_info.headers = {}
+    mock_aio_response.request_info = mock_request_info
+
+
     return AsyncStream(
-        cast_to=object, client=async_client, response=httpx.Response(200, content=to_aiter(content))
+        cast_to=object, client=async_client, response=mock_aio_response
     )._iter_events()

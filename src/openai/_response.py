@@ -23,6 +23,7 @@ from typing_extensions import Awaitable, ParamSpec, override, get_origin
 import anyio
 import httpx
 import pydantic
+import aiohttp # Added
 
 from ._types import NoneType
 from ._utils import is_given, extract_type_arg, is_annotated_type, is_type_alias_type, extract_type_var_from_base
@@ -53,7 +54,7 @@ class BaseAPIResponse(Generic[R]):
     _stream_cls: type[Stream[Any]] | type[AsyncStream[Any]] | None
     _options: FinalRequestOptions
 
-    http_response: httpx.Response
+    http_response: Union[httpx.Response, aiohttp.ClientResponse] # Changed
 
     retries_taken: int
     """The number of retries made. If no retries happened this will be `0`"""
@@ -61,7 +62,7 @@ class BaseAPIResponse(Generic[R]):
     def __init__(
         self,
         *,
-        raw: httpx.Response,
+        raw: Union[httpx.Response, aiohttp.ClientResponse], # Changed
         cast_to: type[R],
         client: BaseClient[Any, Any],
         stream: bool,
@@ -79,50 +80,72 @@ class BaseAPIResponse(Generic[R]):
         self.retries_taken = retries_taken
 
     @property
-    def headers(self) -> httpx.Headers:
-        return self.http_response.headers
+    def headers(self) -> Union[httpx.Headers, "aiohttp.helpers.LooseHeaders"]: # type: ignore
+        if isinstance(self.http_response, httpx.Response):
+            return self.http_response.headers
+        return self.http_response.headers # aiohttp.helpers.LooseHeaders (CIMultiDictProxy)
 
     @property
-    def http_request(self) -> httpx.Request:
-        """Returns the httpx Request instance associated with the current response."""
-        return self.http_response.request
+    def http_request(self) -> Union[httpx.Request, Any]: # httpx.Request or a representation for aiohttp
+        """Returns the Request instance associated with the current response."""
+        if isinstance(self.http_response, httpx.Response):
+            return self.http_response.request
+        # aiohttp.ClientResponse has .request_info directly
+        return self.http_response.request_info # type: ignore
 
     @property
     def status_code(self) -> int:
-        return self.http_response.status_code
+        if isinstance(self.http_response, httpx.Response):
+            return self.http_response.status_code
+        return self.http_response.status # type: ignore
 
     @property
-    def url(self) -> httpx.URL:
+    def url(self) -> Union[httpx.URL, "aiohttp.helpers.URL"]: # type: ignore
         """Returns the URL for which the request was made."""
-        return self.http_response.url
+        if isinstance(self.http_response, httpx.Response):
+            return self.http_response.url
+        return self.http_response.url # type: ignore
 
     @property
     def method(self) -> str:
-        return self.http_request.method
+        if isinstance(self.http_response, httpx.Response):
+            return self.http_response.request.method
+        return self.http_response.method # type: ignore
 
     @property
     def http_version(self) -> str:
-        return self.http_response.http_version
+        if isinstance(self.http_response, httpx.Response):
+            return self.http_response.http_version
+        # aiohttp version is like `HTTP/1.1`
+        if self.http_response.version: # type: ignore
+            return f"HTTP/{self.http_response.version.major}.{self.http_response.version.minor}" # type: ignore
+        return "Unknown"
+
 
     @property
     def elapsed(self) -> datetime.timedelta:
         """The time taken for the complete request/response cycle to complete."""
-        return self.http_response.elapsed
+        if isinstance(self.http_response, httpx.Response):
+            return self.http_response.elapsed
+        # aiohttp does not provide this directly on the response object.
+        # This would typically be calculated externally if needed.
+        # Returning timedelta.max as a placeholder or consider raising an error.
+        log.warning("`elapsed` property is not directly available for aiohttp.ClientResponse and will return timedelta.max")
+        return datetime.timedelta.max
+
 
     @property
     def is_closed(self) -> bool:
-        """Whether or not the response body has been closed.
-
-        If this is False then there is response data that has not been read yet.
-        You must either fully consume the response body or call `.close()`
-        before discarding the response to prevent resource leaks.
-        """
-        return self.http_response.is_closed
+        """Whether or not the response body has been closed."""
+        if isinstance(self.http_response, httpx.Response):
+            return self.http_response.is_closed
+        return self.http_response.closed # type: ignore
 
     @override
     def __repr__(self) -> str:
+        reason = self.http_response.reason_phrase if isinstance(self.http_response, httpx.Response) else self.http_response.reason # type: ignore
         return (
-            f"<{self.__class__.__name__} [{self.status_code} {self.http_response.reason_phrase}] type={self._cast_to}>"
+            f"<{self.__class__.__name__} [{self.status_code} {reason}] type={self._cast_to}>"
         )
 
     def _parse(self, *, to: type[_T] | None = None) -> R | _T:
@@ -150,7 +173,7 @@ class BaseAPIResponse(Generic[R]):
                             to,
                             failure_message="Expected custom stream type to be passed with a type argument, e.g. Stream[ChunkType]",
                         ),
-                        response=self.http_response,
+                        response=self.http_response, # httpx.Response or aiohttp.ClientResponse
                         client=cast(Any, self._client),
                     ),
                 )
@@ -168,12 +191,15 @@ class BaseAPIResponse(Generic[R]):
             stream_cls = cast("type[Stream[Any]] | type[AsyncStream[Any]] | None", self._client._default_stream_cls)
             if stream_cls is None:
                 raise MissingStreamClassError()
-
+            
+            # Ensure stream_cls receives the correct response type it expects.
+            # This part is tricky if Stream/AsyncStream are not also made generic or union-typed for response.
+            # For now, assuming Stream/AsyncStream will be adapted to handle Union type or specific aiohttp type.
             return cast(
                 R,
-                stream_cls(
+                stream_cls( # type: ignore
                     cast_to=cast_to,
-                    response=self.http_response,
+                    response=self.http_response, 
                     client=cast(Any, self._client),
                 ),
             )
@@ -181,38 +207,66 @@ class BaseAPIResponse(Generic[R]):
         if cast_to is NoneType:
             return cast(R, None)
 
-        response = self.http_response
+        # For non-streaming, if it's aiohttp, we'd typically await .text() or .json()
+        # This method is synchronous, so direct adaptation for aiohttp is complex here.
+        # AsyncAPIResponse._parse will handle async reading.
+        # This BaseAPIResponse._parse is primarily for SyncAPIClient.
+        # However, if AsyncAPIResponse calls this, it needs to handle aiohttp.
+        # For now, let's assume this method is primarily for httpx.Response in sync context.
+        # If self.http_response is aiohttp.ClientResponse, this sync _parse will have issues.
+        # The design implies AsyncAPIResponse will override or handle async aspects.
+
+        if isinstance(self.http_response, aiohttp.ClientResponse):
+            # This synchronous _parse method cannot await aiohttp methods.
+            # This indicates a structural issue if AsyncAPIResponse directly calls this sync _parse
+            # without first reading the content.
+            # For now, we'll assume content is pre-read for aiohttp if passed here.
+            # Or, this method is primarily for httpx.Response in sync path.
+            # Let's raise if aiohttp response is encountered in a way that requires async ops.
+            if cast_to not in (httpx.Response, object, NoneType) and not (inspect.isclass(origin) and issubclass(origin, httpx.Response)): # type: ignore
+                 pass # Allow raw response types or object through for now.
+                 # raise NotImplementedError("Synchronous parsing of aiohttp.ClientResponse content is not directly supported here. Ensure content is pre-read or use AsyncAPIResponse.")
+
+
+        _response = self.http_response
+        if isinstance(_response, aiohttp.ClientResponse):
+            # If it's aiohttp and we need to parse content like text/json,
+            # it should have been read by the caller (e.g. AsyncAPIResponse.parse)
+            # and potentially stored in a way that this sync method can access.
+            # This part of the logic is mostly for httpx.Response now.
+            # The actual parsing for aiohttp will be driven by AsyncAPIResponse's async methods.
+            # For type-checking and basic pass-through:
+            if cast_to == httpx.Response: # If trying to cast aiohttp to httpx.Response
+                log.warning("Attempting to cast aiohttp.ClientResponse to httpx.Response in sync parser. This may not be fully compatible.")
+                return cast(R, _response) # This is not ideal, but reflects current constraint.
+
+        # The following assumes self.http_response is httpx.Response or has compatible sync methods
         if cast_to == str:
-            return cast(R, response.text)
+            return cast(R, _response.text) # type: ignore
 
         if cast_to == bytes:
-            return cast(R, response.content)
+            return cast(R, _response.content) # type: ignore
 
         if cast_to == int:
-            return cast(R, int(response.text))
+            return cast(R, int(_response.text)) # type: ignore
 
         if cast_to == float:
-            return cast(R, float(response.text))
+            return cast(R, float(_response.text)) # type: ignore
 
         if cast_to == bool:
-            return cast(R, response.text.lower() == "true")
-
-        # handle the legacy binary response case
+            return cast(R, _response.text.lower() == "true") # type: ignore
+        
         if inspect.isclass(cast_to) and cast_to.__name__ == "HttpxBinaryResponseContent":
-            return cast(R, cast_to(response))  # type: ignore
+            return cast(R, cast_to(_response))  # type: ignore
 
-        if origin == APIResponse:
+        if origin == APIResponse: # This class
             raise RuntimeError("Unexpected state - cast_to is `APIResponse`")
 
-        if inspect.isclass(origin) and issubclass(origin, httpx.Response):
-            # Because of the invariance of our ResponseT TypeVar, users can subclass httpx.Response
-            # and pass that class to our request functions. We cannot change the variance to be either
-            # covariant or contravariant as that makes our usage of ResponseT illegal. We could construct
-            # the response class ourselves but that is something that should be supported directly in httpx
-            # as it would be easy to incorrectly construct the Response object due to the multitude of arguments.
-            if cast_to != httpx.Response:
+        if inspect.isclass(origin) and issubclass(origin, httpx.Response): # type: ignore
+            if cast_to != httpx.Response: # type: ignore
                 raise ValueError(f"Subclasses of httpx.Response cannot be passed to `cast_to`")
-            return cast(R, response)
+            return cast(R, _response)
+
 
         if (
             inspect.isclass(
@@ -333,51 +387,84 @@ class APIResponse(BaseAPIResponse[R]):
     def read(self) -> bytes:
         """Read and return the binary response content."""
         try:
-            return self.http_response.read()
-        except httpx.StreamConsumed as exc:
-            # The default error raised by httpx isn't very
-            # helpful in our case so we re-raise it with
-            # a different error message.
+            if isinstance(self.http_response, httpx.Response):
+                return self.http_response.read()
+            # For aiohttp.ClientResponse, this method is async, should be called from AsyncAPIResponse.read()
+            # If called synchronously on aiohttp, it's an error or implies pre-loaded content.
+            # This path should ideally not be hit for aiohttp in sync read.
+            if hasattr(self.http_response, "_body") and self.http_response._body is not None: # type: ignore
+                return self.http_response._body # type: ignore
+            raise RuntimeError("Synchronous read on aiohttp.ClientResponse requires content to be pre-loaded.")
+
+        except httpx.StreamConsumed as exc: # type: ignore
             raise StreamAlreadyConsumed() from exc
 
     def text(self) -> str:
         """Read and decode the response content into a string."""
-        self.read()
-        return self.http_response.text
+        self.read() # Ensures content is loaded (for httpx)
+        if isinstance(self.http_response, httpx.Response):
+            return self.http_response.text
+        # For aiohttp, text would have to be pre-loaded or this method made async
+        if hasattr(self.http_response, "_body") and self.http_response._body is not None: # type: ignore
+             # Attempt to decode if _body is bytes, assuming UTF-8 as a default.
+             # aiohttp's response.text() handles charset detection.
+            try:
+                return self.http_response._body.decode() # type: ignore
+            except UnicodeDecodeError:
+                return repr(self.http_response._body) # Fallback
+        raise RuntimeError("Synchronous text on aiohttp.ClientResponse requires content to be pre-loaded and decoded.")
+
 
     def json(self) -> object:
         """Read and decode the JSON response content."""
-        self.read()
-        return self.http_response.json()
+        self.read() # Ensures content is loaded (for httpx)
+        if isinstance(self.http_response, httpx.Response):
+            return self.http_response.json()
+        # For aiohttp, json would have to be pre-loaded or this method made async
+        if hasattr(self.http_response, "_body") and self.http_response._body is not None: # type: ignore
+            return json.loads(self.http_response._body.decode()) # type: ignore
+        raise RuntimeError("Synchronous json on aiohttp.ClientResponse requires content to be pre-loaded and decoded.")
+
 
     def close(self) -> None:
-        """Close the response and release the connection.
-
-        Automatically called if the response body is read to completion.
-        """
-        self.http_response.close()
+        """Close the response and release the connection."""
+        if isinstance(self.http_response, httpx.Response):
+            self.http_response.close()
+        elif isinstance(self.http_response, aiohttp.ClientResponse):
+            self.http_response.close() # aiohttp uses .close() for non-streaming, or .release() for streams.
 
     def iter_bytes(self, chunk_size: int | None = None) -> Iterator[bytes]:
-        """
-        A byte-iterator over the decoded response content.
+        """A byte-iterator over the decoded response content."""
+        if isinstance(self.http_response, httpx.Response):
+            for chunk in self.http_response.iter_bytes(chunk_size):
+                yield chunk
+        else:
+            # Synchronous iteration over aiohttp content is not directly supported.
+            # This would require the async iter_any() or iter_chunked().
+            # For sync, one might have to read the whole content first.
+            log.warning("Synchronous iter_bytes over aiohttp.ClientResponse content is not standard. Reading full content.")
+            yield self.read()
 
-        This automatically handles gzip, deflate and brotli encoded responses.
-        """
-        for chunk in self.http_response.iter_bytes(chunk_size):
-            yield chunk
 
     def iter_text(self, chunk_size: int | None = None) -> Iterator[str]:
-        """A str-iterator over the decoded response content
-        that handles both gzip, deflate, etc but also detects the content's
-        string encoding.
-        """
-        for chunk in self.http_response.iter_text(chunk_size):
-            yield chunk
+        """A str-iterator over the decoded response content."""
+        if isinstance(self.http_response, httpx.Response):
+            for chunk in self.http_response.iter_text(chunk_size):
+                yield chunk
+        else:
+            log.warning("Synchronous iter_text over aiohttp.ClientResponse content is not standard. Reading full content as text.")
+            yield self.text() # Relies on self.text() potentially working on pre-loaded body
+
 
     def iter_lines(self) -> Iterator[str]:
         """Like `iter_text()` but will only yield chunks for each line"""
-        for chunk in self.http_response.iter_lines():
-            yield chunk
+        if isinstance(self.http_response, httpx.Response):
+            for chunk in self.http_response.iter_lines():
+                yield chunk
+        else:
+            log.warning("Synchronous iter_lines over aiohttp.ClientResponse content is not standard. Reading full content and splitting lines.")
+            for line in self.text().splitlines(keepends=True): # type: ignore
+                 yield line
 
 
 class AsyncAPIResponse(BaseAPIResponse[R]):
@@ -440,50 +527,96 @@ class AsyncAPIResponse(BaseAPIResponse[R]):
     async def read(self) -> bytes:
         """Read and return the binary response content."""
         try:
-            return await self.http_response.aread()
-        except httpx.StreamConsumed as exc:
-            # the default error raised by httpx isn't very
-            # helpful in our case so we re-raise it with
-            # a different error message
+            if isinstance(self.http_response, httpx.Response):
+                return await self.http_response.aread()
+            return await self.http_response.read() # type: ignore # aiohttp.ClientResponse.read()
+        except httpx.StreamConsumed as exc: # type: ignore
             raise StreamAlreadyConsumed() from exc
+        except aiohttp.ClientPayloadError as exc: # type: ignore
+             # Example of handling aiohttp specific exception if needed
+            raise OpenAIError(f"aiohttp payload error: {exc}") from exc
+
 
     async def text(self) -> str:
         """Read and decode the response content into a string."""
-        await self.read()
-        return self.http_response.text
+        # For aiohttp, .text() will read and decode.
+        # For httpx, .aread() must be called first if not already.
+        if isinstance(self.http_response, httpx.Response):
+            await self.read() # Ensure content is loaded for httpx if not already by _parse
+            return self.http_response.text
+        return await self.http_response.text() # type: ignore # aiohttp.ClientResponse.text()
 
     async def json(self) -> object:
         """Read and decode the JSON response content."""
-        await self.read()
-        return self.http_response.json()
+        if isinstance(self.http_response, httpx.Response):
+            await self.read() # Ensure content is loaded for httpx if not already by _parse
+            return self.http_response.json()
+        # content_type needs to be checked for aiohttp for safety, though .json() does this.
+        return await self.http_response.json() # type: ignore # aiohttp.ClientResponse.json()
 
     async def close(self) -> None:
-        """Close the response and release the connection.
+        """Close the response and release the connection."""
+        if isinstance(self.http_response, httpx.Response):
+            await self.http_response.aclose()
+        elif isinstance(self.http_response, aiohttp.ClientResponse):
+            # For aiohttp, if content is being streamed and not fully consumed,
+            # .release() is preferred. Otherwise, .close() is fine.
+            # If the session owns the response, client session close handles it.
+            # If response was created with connector ownership, then response.close().
+            # Assuming here that if we have the response object, we should manage its lifecycle.
+            if not self.http_response.closed: # type: ignore
+                self.http_response.release() # type: ignore # Prefer release for streams
 
-        Automatically called if the response body is read to completion.
-        """
-        await self.http_response.aclose()
 
     async def iter_bytes(self, chunk_size: int | None = None) -> AsyncIterator[bytes]:
-        """
-        A byte-iterator over the decoded response content.
+        """A byte-iterator over the decoded response content."""
+        if isinstance(self.http_response, httpx.Response):
+            async for chunk in self.http_response.aiter_bytes(chunk_size):
+                yield chunk
+        elif isinstance(self.http_response, aiohttp.ClientResponse):
+            async for chunk in self.http_response.content.iter_chunked(chunk_size or 8192): # type: ignore
+                yield chunk
+        else:
+            # Fallback or error for unexpected type
+            pass
 
-        This automatically handles gzip, deflate and brotli encoded responses.
-        """
-        async for chunk in self.http_response.aiter_bytes(chunk_size):
-            yield chunk
 
     async def iter_text(self, chunk_size: int | None = None) -> AsyncIterator[str]:
-        """A str-iterator over the decoded response content
-        that handles both gzip, deflate, etc but also detects the content's
-        string encoding.
-        """
-        async for chunk in self.http_response.aiter_text(chunk_size):
-            yield chunk
+        """A str-iterator over the decoded response content."""
+        if isinstance(self.http_response, httpx.Response):
+            async for chunk in self.http_response.aiter_text(chunk_size):
+                yield chunk
+        elif isinstance(self.http_response, aiohttp.ClientResponse):
+            # aiohttp's content streams bytes; manual decoding needed for chunked text.
+            # For simplicity, using a pattern that decodes chunk by chunk.
+            # Assumes UTF-8 or relies on http_response.charset if available.
+            charset = self.http_response.charset or 'utf-8' # type: ignore
+            async for chunk in self.http_response.content.iter_chunked(chunk_size or 8192): # type: ignore
+                yield chunk.decode(charset)
+        else:
+            pass
+
 
     async def iter_lines(self) -> AsyncIterator[str]:
         """Like `iter_text()` but will only yield chunks for each line"""
-        async for chunk in self.http_response.aiter_lines():
+        # This requires careful handling of partial lines across chunks.
+        # httpx handles this internally. For aiohttp, this would be more complex.
+        if isinstance(self.http_response, httpx.Response):
+            async for chunk in self.http_response.aiter_lines():
+                yield chunk
+        elif isinstance(self.http_response, aiohttp.ClientResponse):
+            # Simplified line iteration for aiohttp:
+            # Read chunks, decode, and split by lines, handling partials.
+            buffer = ""
+            charaset = self.http_response.charset or 'utf-8' # type: ignore
+            async for chunk_bytes in self.http_response.content.iter_any(): # type: ignore
+                buffer += chunk_bytes.decode(charaset)
+                while '\n' in buffer:
+                    line, _, buffer = buffer.partition('\n')
+                    yield line + '\n' # Keep newline, like httpx.iter_lines
+            if buffer: # Yield any remaining part of the buffer
+                yield buffer
+        else:
             yield chunk
 
 

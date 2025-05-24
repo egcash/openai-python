@@ -4,16 +4,20 @@ from __future__ import annotations
 import json
 import inspect
 from types import TracebackType
-from typing import TYPE_CHECKING, Any, Generic, TypeVar, Iterator, AsyncIterator, cast
+from typing import TYPE_CHECKING, Any, Generic, TypeVar, Iterator, AsyncIterator, cast, Union # Added Union
 from typing_extensions import Self, Protocol, TypeGuard, override, get_origin, runtime_checkable
 
 import httpx
+import aiohttp # Added
 
 from ._utils import is_mapping, extract_type_var_from_base
 from ._exceptions import APIError
 
 if TYPE_CHECKING:
     from ._client import OpenAI, AsyncOpenAI
+    from httpx import Request as HttpxRequest # For APIError
+    from aiohttp.helpers import SimpleCookie # For type hinting if needed
+    from yarl import URL as YarlURL # For type hinting if needed
 
 
 _T = TypeVar("_T")
@@ -123,16 +127,17 @@ class Stream(Generic[_T]):
 class AsyncStream(Generic[_T]):
     """Provides the core interface to iterate over an asynchronous stream response."""
 
-    response: httpx.Response
-
+    response: Union[httpx.Response, aiohttp.ClientResponse] # Changed
+    _cast_to: type[_T]
+    _client: AsyncOpenAI # type: ignore
     _decoder: SSEDecoder | SSEBytesDecoder
 
     def __init__(
         self,
         *,
         cast_to: type[_T],
-        response: httpx.Response,
-        client: AsyncOpenAI,
+        response: Union[httpx.Response, aiohttp.ClientResponse], # Changed
+        client: AsyncOpenAI, # type: ignore
     ) -> None:
         self.response = response
         self._cast_to = cast_to
@@ -148,13 +153,65 @@ class AsyncStream(Generic[_T]):
             yield item
 
     async def _iter_events(self) -> AsyncIterator[ServerSentEvent]:
-        async for sse in self._decoder.aiter_bytes(self.response.aiter_bytes()):
-            yield sse
+        if isinstance(self.response, httpx.Response):
+            async for sse in self._decoder.aiter_bytes(self.response.aiter_bytes()):
+                yield sse
+        elif isinstance(self.response, aiohttp.ClientResponse):
+            async for sse in self._decoder.aiter_bytes(self.response.content.iter_any()): # type: ignore
+                yield sse
+        else:
+            # Handle cases where response might be an unexpected type, though type hints should prevent this.
+            raise TypeError(f"Unexpected response type: {type(self.response)}")
+
 
     async def __stream__(self) -> AsyncIterator[_T]:
         cast_to = cast(Any, self._cast_to)
-        response = self.response
-        process_data = self._client._process_response_data
+        # The `response` argument for `process_data` and `APIError` expects `httpx.Response`.
+        # This is a point of friction. For now, we might need to construct a mock or partial
+        # httpx.Response if the actual one is aiohttp.ClientResponse, or adapt downstream.
+        # For this step, we'll focus on getting the stream data.
+        # The `APIError` request object will be problematic.
+        
+        # Construct a pseudo httpx.Request for APIError
+        pseudo_request: Union[HttpxRequest, None] = None # type: ignore
+        if isinstance(self.response, httpx.Response):
+            pseudo_request = self.response.request
+        elif isinstance(self.response, aiohttp.ClientResponse):
+            # Create a minimal httpx.Request object for compatibility with APIError
+            pseudo_request = httpx.Request( # type: ignore
+                method=self.response.method, # type: ignore
+                url=str(self.response.url), # type: ignore
+                headers=self.response.headers, # type: ignore
+            )
+            
+        # The `response` passed to process_data also needs to be httpx.Response.
+        # This implies that if we fully switch to aiohttp.ClientResponse for streaming,
+        # _process_response_data and APIError need to be adapted, or we use a compatibility wrapper here.
+        
+        pseudo_request: Union[HttpxRequest, None] = None # type: ignore
+        response_for_processing: httpx.Response # For process_data and APIError
+
+        if isinstance(self.response, httpx.Response):
+            pseudo_request = self.response.request
+            response_for_processing = self.response
+        elif isinstance(self.response, aiohttp.ClientResponse):
+            pseudo_request = httpx.Request( # type: ignore
+                method=self.response.method, # type: ignore
+                url=str(self.response.url), # type: ignore
+                headers=self.response.headers, # type: ignore
+            )
+            # Create a minimal httpx.Response for compatibility with process_data / APIError
+            # This is a stop-gap. Content is not being set here as it's streamed.
+            response_for_processing = httpx.Response( # type: ignore
+                status_code=self.response.status, # type: ignore
+                headers=self.response.headers, # type: ignore
+                request=pseudo_request
+            )
+        else:
+            # Should not happen due to type hints
+            raise TypeError(f"Unexpected response type in AsyncStream: {type(self.response)}")
+
+        process_data = self._client._process_response_data 
         iterator = self._iter_events()
 
         async for sse in iterator:
@@ -165,38 +222,27 @@ class AsyncStream(Generic[_T]):
                 data = sse.json()
                 if is_mapping(data) and data.get("error"):
                     message = None
-                    error = data.get("error")
-                    if is_mapping(error):
-                        message = error.get("message")
+                    error_data = data.get("error")
+                    if is_mapping(error_data):
+                        message = error_data.get("message")
                     if not message or not isinstance(message, str):
                         message = "An error occurred during streaming"
+                    raise APIError(message=message, request=pseudo_request, body=error_data)
 
-                    raise APIError(
-                        message=message,
-                        request=self.response.request,
-                        body=data["error"],
-                    )
-
-                yield process_data(data=data, cast_to=cast_to, response=response)
+                yield process_data(data=data, cast_to=cast_to, response=response_for_processing)
 
             else:
                 data = sse.json()
-
                 if sse.event == "error" and is_mapping(data) and data.get("error"):
                     message = None
-                    error = data.get("error")
-                    if is_mapping(error):
-                        message = error.get("message")
+                    error_data = data.get("error")
+                    if is_mapping(error_data):
+                        message = error_data.get("message")
                     if not message or not isinstance(message, str):
                         message = "An error occurred during streaming"
-
-                    raise APIError(
-                        message=message,
-                        request=self.response.request,
-                        body=data["error"],
-                    )
-
-                yield process_data(data={"data": data, "event": sse.event}, cast_to=cast_to, response=response)
+                    raise APIError(message=message, request=pseudo_request, body=error_data)
+                
+                yield process_data(data={"data": data, "event": sse.event}, cast_to=cast_to, response=response_for_processing)
 
         # Ensure the entire stream is consumed
         async for _sse in iterator:
@@ -219,7 +265,11 @@ class AsyncStream(Generic[_T]):
 
         Automatically called if the response body is read to completion.
         """
-        await self.response.aclose()
+        if isinstance(self.response, httpx.Response):
+            await self.response.aclose()
+        elif isinstance(self.response, aiohttp.ClientResponse):
+            if not self.response.closed:
+                self.response.release() # For aiohttp, release the connection if not closed.
 
 
 class ServerSentEvent:

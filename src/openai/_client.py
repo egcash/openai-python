@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING, Any, Union, Mapping
 from typing_extensions import Self, override
 
 import httpx
+import aiohttp # Added for ClientSession type hint
 
 from . import _exceptions
 from ._qs import Querystring
@@ -400,10 +401,10 @@ class AsyncOpenAI(AsyncAPIClient):
         max_retries: int = DEFAULT_MAX_RETRIES,
         default_headers: Mapping[str, str] | None = None,
         default_query: Mapping[str, object] | None = None,
-        # Configure a custom httpx client.
-        # We provide a `DefaultAsyncHttpxClient` class that you can pass to retain the default values we use for `limits`, `timeout` & `follow_redirects`.
-        # See the [httpx documentation](https://www.python-httpx.org/api/#asyncclient) for more details.
-        http_client: httpx.AsyncClient | None = None,
+        # Configure a custom aiohttp client.
+        # Pass an `aiohttp.ClientSession` instance to customize client behavior.
+        # See the [aiohttp documentation](https://docs.aiohttp.dev/en/stable/client_reference.html) for more details.
+        http_client: aiohttp.ClientSession | None = None, # Changed
         # Enable or disable schema validation for data returned by the API.
         # When enabled an error APIResponseValidationError is raised
         # if the API responds with invalid data for the expected schema.
@@ -592,7 +593,7 @@ class AsyncOpenAI(AsyncAPIClient):
         websocket_base_url: str | httpx.URL | None = None,
         base_url: str | httpx.URL | None = None,
         timeout: float | Timeout | None | NotGiven = NOT_GIVEN,
-        http_client: httpx.AsyncClient | None = None,
+        http_client: aiohttp.ClientSession | None = None, # Changed
         max_retries: int | NotGiven = NOT_GIVEN,
         default_headers: Mapping[str, str] | None = None,
         set_default_headers: Mapping[str, str] | None = None,
